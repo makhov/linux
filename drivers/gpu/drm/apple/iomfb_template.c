@@ -926,15 +926,25 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 
-	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(50));
+	/*
+	 * On DP unplug DCP firmware first tears down the link itself (HPD
+	 * removal, M3 power down, set_device_enabled 1 -> 0), which can take
+	 * more than 50 ms. Only processes the clear swap afterwards. Don't
+	 * mistake that for a crash: dcp->crashed permanently rejects every
+	 * atomic check on this CRTC.
+	 */
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
 	swap_id = cookie->swap_id;
 	kref_put(&cookie->refcount, release_swap_cookie);
 	if (ret <= 0) {
+		dev_err(dcp->dev, "%s: clear swap timed out, marking DCP as crashed\n",
+			__func__);
 		dcp->crashed = true;
 		return;
 	}
 
-	dev_dbg(dcp->dev, "%s: clear swap submitted: %u\n", __func__, swap_id);
+	dev_dbg(dcp->dev, "%s: clear swap submitted: %u after %u ms\n", __func__,
+		swap_id, 1000 - jiffies_to_msecs(ret));
 
 	poff_cookie = kzalloc(sizeof(*poff_cookie), GFP_KERNEL);
 	if (!poff_cookie)
