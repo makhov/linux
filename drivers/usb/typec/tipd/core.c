@@ -784,6 +784,24 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 	return 0;
 }
 
+static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state);
+
+static void cd321x_restore_power_state(struct tps6598x *tps)
+{
+	u8 state;
+	int ret;
+
+	ret = tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &state);
+	if (ret || state == TPS_SYSTEM_POWER_STATE_S0)
+		return;
+
+	dev_warn(tps->dev, "system power state is 0x%02x, switching back to S0\n",
+		 state);
+	ret = cd321x_switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	if (ret)
+		dev_err(tps->dev, "failed to switch to S0: %d\n", ret);
+}
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -804,6 +822,21 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 		goto err_unlock;
 
 	tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+
+	/*
+	 * The controller can get reset behind our back, which reverts the
+	 * interrupt mask and the system power state programmed at probe. Out
+	 * of S0 it no longer swaps data role or enters DP altmode, so a
+	 * monitor only charges the machine. An event outside our mask means
+	 * the mask was lost; also recheck the power state on every plug.
+	 */
+	if (event & ~tps->data->irq_mask1) {
+		dev_warn(tps->dev, "unexpected events 0x%llx, controller was reset?\n",
+			 event & ~tps->data->irq_mask1);
+		tps6598x_write64(tps, TPS_REG_INT_MASK1, tps->data->irq_mask1);
+	}
+	if (event & (~tps->data->irq_mask1 | APPLE_CD_REG_INT_PLUG_EVENT))
+		cd321x_restore_power_state(tps);
 
 	if (!tps6598x_read_status(tps, &status))
 		goto err_unlock;
