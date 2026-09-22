@@ -58,6 +58,15 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 
+unsigned int dcp_get_num_dp_ports(struct platform_device *pdev);
+struct fwnode_handle *dcp_get_dp_port_fwnode(struct platform_device *pdev,
+					     unsigned int port);
+void dcp_link_dp_port(struct platform_device *pdev, unsigned int port,
+		      struct apple_connector *connector);
+int dcp_dp_port_connect(struct platform_device *pdev, unsigned int port);
+int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port);
+void dcp_dp_ports_debugfs_init(struct platform_device *pdev, struct dentry *root);
+
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
 /* rtkit message handler for IOMFB messages */

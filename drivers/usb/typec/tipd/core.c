@@ -1202,8 +1202,15 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_unregister_altmodes;
 	}
 
+	/*
+	 * Like typec_displayport, fall back to the connector node itself when
+	 * there is no "displayport" phandle, so a DRM connector can bind to
+	 * this Type-C port directly.
+	 */
 	if (fwnode_property_present(fwnode, "displayport"))
 		connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	else
+		connector_fwnode = fwnode_handle_get(fwnode);
 	if (!IS_ERR_OR_NULL(connector_fwnode))
 		cd321x->connector_fwnode = connector_fwnode;
 

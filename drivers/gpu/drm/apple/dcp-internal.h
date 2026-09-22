@@ -114,6 +114,20 @@ struct apple_dcp_hw_data {
 };
 
 /* TODO: move IOMFB members to its own struct */
+#define DCP_MAX_DP_PORTS 3
+
+/* A DP capable Type-C port this DCP can be routed to */
+struct dcp_dp_port {
+	struct fwnode_handle *fwnode;
+	struct phy *phy;
+	struct mux_control *xbar;
+	struct apple_connector *connector;
+	/* ATC PHY index the DCP firmware is told to use for this port */
+	u32 dptx_phy;
+	/* the Type-C stack says a DP sink is attached to this port */
+	bool oob_connected;
+};
+
 struct apple_dcp {
 	struct device *dev;
 	struct platform_device *piodma;
@@ -266,9 +280,26 @@ struct apple_dcp {
 	u32 dptx_phy;
 	u32 dptx_die;
 	int hdmi_hpd_irq;
+
+	/*
+	 * DP capable Type-C ports this DCP can drive. The DCP is bound to one
+	 * of them while a display is connected: its crossbar is selected and
+	 * "phy"/"dptx_phy"/"connector" above point at that port.
+	 */
+	struct delayed_work dp_recover_wq;
+	unsigned int dp_relink_attempts;
+	struct dcp_dp_port dp_ports[DCP_MAX_DP_PORTS];
+	unsigned int num_dp_ports;
+	int active_dp_port;
+	u32 mux_index;
+	bool xbar_selected;
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
+
+/* the DCP reported that the display on the bound Type-C port is gone */
+void dcp_dp_display_gone(struct apple_dcp *dcp);
+void dcp_dp_display_back(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);

@@ -6,6 +6,7 @@
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/component.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
@@ -18,9 +19,11 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -345,6 +348,17 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 		return -EINVAL;
 	}
 
+	/*
+	 * Turning the CRTC on without a display would ask the firmware to set
+	 * a mode on a link that is not there. That modeset fails, no swap ever
+	 * completes and the commit times out, so reject it here instead.
+	 */
+	if (dcp->num_dp_ports && crtc_state->active && !dcp->connector->connected) {
+		dev_err(dcp->dev, "crtc_atomic_check: no display on port %d\n",
+			dcp->active_dp_port);
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -449,6 +463,328 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		dptxport_set_hpd(dcp->dptxport[port].service, false);
 
 	return dcp_dptx_disconnect(dcp, port);
+}
+
+/*
+ * Bind this DCP to one of its DP capable Type-C ports: route the port's
+ * crossbar to us and use the port's PHY from now on. The DCP firmware learns
+ * about the PHY with the next dptxport_connect().
+ */
+static int dcp_dp_bind_port(struct apple_dcp *dcp, unsigned int port)
+{
+	struct dcp_dp_port *p = &dcp->dp_ports[port];
+	int ret;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+
+	if (dcp->active_dp_port == port)
+		return 0;
+	if (dcp->active_dp_port >= 0) {
+		dev_info(dcp->dev,
+			 "port %u: already driving port %d, ignoring\n", port,
+			 dcp->active_dp_port);
+		return -EBUSY;
+	}
+
+	ret = mux_control_try_select(p->xbar, dcp->mux_index);
+	if (ret) {
+		dev_err(dcp->dev, "port %u: crossbar select failed: %d\n", port,
+			ret);
+		return ret;
+	}
+
+	dcp->xbar_selected = true;
+	dcp->xbar = p->xbar;
+	dcp->phy = p->phy;
+	dcp->dptx_phy = p->dptx_phy;
+	dcp->connector = p->connector;
+	dcp->active_dp_port = port;
+
+	dev_dbg(dcp->dev, "port %u: bound, dptx target phy %u\n", port,
+		p->dptx_phy);
+
+	return 0;
+}
+
+static void dcp_dp_unbind_port(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+
+	if (dcp->active_dp_port < 0)
+		return;
+
+	dev_dbg(dcp->dev, "port %d: unbound\n", dcp->active_dp_port);
+
+	if (dcp->xbar_selected)
+		mux_control_deselect(dcp->xbar);
+	dcp->xbar_selected = false;
+	dcp->active_dp_port = -1;
+}
+
+int dcp_dp_port_connect(struct platform_device *pdev, unsigned int port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
+
+	if (port >= dcp->num_dp_ports)
+		return -EINVAL;
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		dcp->dp_ports[port].oob_connected = true;
+		ret = dcp_dp_bind_port(dcp, port);
+		if (ret)
+			return ret;
+	}
+	dcp->dp_relink_attempts = 0;
+
+	ret = dcp_dptx_connect(dcp, 0);
+	if (ret) {
+		guard(mutex)(&dcp->hpd_mutex);
+		dcp_dp_unbind_port(dcp);
+	}
+
+	return ret;
+}
+
+/*
+ * The DCP told us the display on the bound port is gone. Two cases:
+ *
+ * - the cable is gone: the Type-C stack has already told us, so release the
+ *   port and let another one take the DCP.
+ * - the link dropped while the cable is still there: displays do that on
+ *   their own, for instance shortly after a modeset or while blanked. No
+ *   further Type-C event will come, so take the link down and bring it back
+ *   up ourselves. Giving up here would leave the display dark until replug.
+ */
+#define DCP_DP_RELINK_DELAY	msecs_to_jiffies(1000)
+#define DCP_DP_RELINK_TRIES	3
+
+static void dcp_dp_recover_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, dp_recover_wq);
+	bool cable_gone;
+	int port;
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		port = dcp->active_dp_port;
+		if (port < 0)
+			return;
+		cable_gone = !dcp->dp_ports[port].oob_connected;
+	}
+
+	/* came back on its own while we waited */
+	if (!cable_gone && dcp->connector && dcp->connector->connected) {
+		dcp->dp_relink_attempts = 0;
+		return;
+	}
+
+	if (!cable_gone && dcp->dp_relink_attempts < DCP_DP_RELINK_TRIES) {
+		dcp->dp_relink_attempts++;
+		dev_info(dcp->dev, "port %d: link lost, relinking (%u/%u)\n",
+			 port, dcp->dp_relink_attempts, DCP_DP_RELINK_TRIES);
+
+		dcp_dptx_disconnect(dcp, 0);
+		msleep(100);
+		dcp_dptx_connect(dcp, 0);
+
+		schedule_delayed_work(&dcp->dp_recover_wq, DCP_DP_RELINK_DELAY);
+		return;
+	}
+
+	dev_info(dcp->dev, "port %d: %s, releasing\n", port,
+		 cable_gone ? "display gone" : "link lost for good");
+
+	dcp->dp_relink_attempts = 0;
+	dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_dp_unbind_port(dcp);
+}
+
+void dcp_dp_display_gone(struct apple_dcp *dcp)
+{
+	if (dcp->num_dp_ports && dcp->active_dp_port >= 0)
+		mod_delayed_work(system_wq, &dcp->dp_recover_wq,
+				 DCP_DP_RELINK_DELAY);
+}
+
+void dcp_dp_display_back(struct apple_dcp *dcp)
+{
+	if (dcp->num_dp_ports && dcp->active_dp_port >= 0) {
+		dcp->dp_relink_attempts = 0;
+		cancel_delayed_work(&dcp->dp_recover_wq);
+	}
+}
+
+int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (port >= dcp->num_dp_ports)
+		return -EINVAL;
+
+	/* events from ports we are not driving are not ours to act on */
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		dcp->dp_ports[port].oob_connected = false;
+		if (dcp->active_dp_port != port)
+			return 0;
+	}
+
+	cancel_delayed_work_sync(&dcp->dp_recover_wq);
+	dcp->dp_relink_attempts = 0;
+	dcp_dptx_disconnect_oob(pdev, 0);
+
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_dp_unbind_port(dcp);
+
+	return 0;
+}
+
+static int dcp_dp_ports_show(struct seq_file *m, void *unused)
+{
+	struct apple_dcp *dcp = m->private;
+	unsigned int i;
+
+	guard(mutex)(&dcp->hpd_mutex);
+
+	seq_printf(m, "active port: %d\n", dcp->active_dp_port);
+	for (i = 0; i < dcp->num_dp_ports; i++) {
+		struct dcp_dp_port *p = &dcp->dp_ports[i];
+
+		seq_printf(m, "port %u: %pfwP dptx-phy %u connector %s%s\n", i,
+			   p->fwnode, p->dptx_phy,
+			   p->connector ? p->connector->base.name : "none",
+			   p->connector && p->connector->connected ? " connected" : "");
+	}
+
+	return 0;
+}
+
+static int dcp_dp_ports_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, dcp_dp_ports_show, inode->i_private);
+}
+
+/* "release" forces the active port to be released, for debugging */
+static ssize_t dcp_dp_ports_write(struct file *file, const char __user *ubuf,
+				  size_t len, loff_t *ppos)
+{
+	struct apple_dcp *dcp = ((struct seq_file *)file->private_data)->private;
+	char buf[16];
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	if (!sysfs_streq(buf, "release"))
+		return -EINVAL;
+
+	dcp_dp_display_gone(dcp);
+
+	return len;
+}
+
+static const struct file_operations dcp_dp_ports_fops = {
+	.owner = THIS_MODULE,
+	.open = dcp_dp_ports_open,
+	.read = seq_read,
+	.write = dcp_dp_ports_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+void dcp_dp_ports_debugfs_init(struct platform_device *pdev, struct dentry *root)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp->num_dp_ports)
+		debugfs_create_file("dp_ports", 0644, root, dcp,
+				    &dcp_dp_ports_fops);
+}
+
+unsigned int dcp_get_num_dp_ports(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->num_dp_ports;
+}
+
+struct fwnode_handle *dcp_get_dp_port_fwnode(struct platform_device *pdev,
+					     unsigned int port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (port >= dcp->num_dp_ports)
+		return NULL;
+
+	return dcp->dp_ports[port].fwnode;
+}
+
+void dcp_link_dp_port(struct platform_device *pdev, unsigned int port,
+		      struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (port < dcp->num_dp_ports)
+		dcp->dp_ports[port].connector = connector;
+}
+
+/*
+ * Type-C ports this DCP can drive:
+ *   apple,dp-connectors = <&typec0>, <&typec1>, ...;   usb-c-connector nodes
+ *   apple,dptx-phys = <0 1 ...>;                       ATC index per port
+ *   phys/phy-names, mux-controls/mux-control-names:    "dp-portN", "dp-xbarN"
+ */
+static int dcp_parse_dp_ports(struct device *dev, struct apple_dcp *dcp)
+{
+	u32 dptx_phys[DCP_MAX_DP_PORTS];
+	int num, i, ret;
+
+	dcp->active_dp_port = -1;
+
+	num = device_property_count_u32(dev, "apple,dptx-phys");
+	if (num <= 0)
+		return 0;
+	if (num > DCP_MAX_DP_PORTS) {
+		dev_err(dev, "too many DP ports: %d\n", num);
+		return -EINVAL;
+	}
+
+	ret = device_property_read_u32_array(dev, "apple,dptx-phys", dptx_phys,
+					     num);
+	if (ret)
+		return dev_err_probe(dev, ret, "apple,dptx-phys\n");
+
+	for (i = 0; i < num; i++) {
+		struct dcp_dp_port *p = &dcp->dp_ports[i];
+		char name[16];
+
+		p->dptx_phy = dptx_phys[i];
+
+		p->fwnode = fwnode_find_reference(dev_fwnode(dev),
+						  "apple,dp-connectors", i);
+		if (IS_ERR(p->fwnode))
+			return dev_err_probe(dev, PTR_ERR(p->fwnode),
+					     "apple,dp-connectors[%d]\n", i);
+
+		snprintf(name, sizeof(name), "dp-port%d", i);
+		p->phy = devm_phy_get(dev, name);
+		if (IS_ERR(p->phy))
+			return dev_err_probe(dev, PTR_ERR(p->phy), "%s\n", name);
+
+		snprintf(name, sizeof(name), "dp-xbar%d", i);
+		p->xbar = devm_mux_control_get(dev, name);
+		if (IS_ERR(p->xbar))
+			return dev_err_probe(dev, PTR_ERR(p->xbar), "%s\n", name);
+	}
+
+	dcp->num_dp_ports = num;
+	dev_info(dev, "%d DP capable Type-C ports\n", num);
+
+	return 0;
 }
 
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
@@ -1064,6 +1400,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	set_bit(0, dcp->memdesc_map);
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_DELAYED_WORK(&dcp->dp_recover_wq, dcp_dp_recover_work);
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
@@ -1159,6 +1496,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	int surf, num_surfs;
 	u32 surf_en;
 	u32 mux_index;
+	int ret;
 
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
@@ -1187,6 +1525,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
 	}
+
+	ret = dcp_parse_dp_ports(dev, dcp);
+	if (ret)
+		return ret;
+	if (dcp->num_dp_ports)
+		dcp->phy = dcp->dp_ports[0].phy;
 
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
@@ -1258,7 +1602,15 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 
 		ret = of_property_read_u32(dev->of_node, "mux-index", &mux_index);
-		if (!ret) {
+		if (!ret)
+			dcp->mux_index = mux_index;
+
+		/*
+		 * With DP capable Type-C ports the crossbar is selected per
+		 * hotplug, for whichever port the display is on, and the PHY
+		 * mode is set by the Type-C stack.
+		 */
+		if (!ret && !dcp->num_dp_ports) {
 			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
 			if (IS_ERR(dcp->xbar)) {
 				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));
@@ -1267,6 +1619,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			ret = mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
+			dcp->xbar_selected = !ret;
 
 			/*
 			 * Switch atcphy to DP-only. should move to a Macbook Pro

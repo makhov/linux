@@ -1053,7 +1053,11 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		/* after unplug swap will not complete until the next
 		 * set_digital_out_mode */
 		schedule_work(&dcp->vblank_wq);
+		dcp_dp_display_gone(dcp);
 	}
+
+	if (*connected)
+		dcp_dp_display_back(dcp);
 
 	if (connector && connector->connected != !!(*connected)) {
 		connector->connected = !!(*connected);
