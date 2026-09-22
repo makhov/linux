@@ -284,6 +284,7 @@ struct apple_dcp {
 	 * of them while a display is connected: its crossbar is selected and
 	 * "phy"/"dptx_phy"/"connector" above point at that port.
 	 */
+	struct work_struct dp_release_wq;
 	struct dcp_dp_port dp_ports[DCP_MAX_DP_PORTS];
 	unsigned int num_dp_ports;
 	int active_dp_port;
@@ -292,6 +293,9 @@ struct apple_dcp {
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
+
+/* the DCP reported that the display on the bound Type-C port is gone */
+void dcp_dp_display_gone(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);

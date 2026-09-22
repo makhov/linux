@@ -65,6 +65,7 @@ void dcp_link_dp_port(struct platform_device *pdev, unsigned int port,
 		      struct apple_connector *connector);
 int dcp_dp_port_connect(struct platform_device *pdev, unsigned int port);
 int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port);
+void dcp_dp_ports_debugfs_init(struct platform_device *pdev, struct dentry *root);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);

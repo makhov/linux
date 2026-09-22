@@ -6,6 +6,7 @@
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/component.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
@@ -18,9 +19,11 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -345,6 +348,17 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 		return -EINVAL;
 	}
 
+	/*
+	 * Turning the CRTC on without a display would ask the firmware to set
+	 * a mode on a link that is not there. That modeset fails, no swap ever
+	 * completes and the commit times out, so reject it here instead.
+	 */
+	if (dcp->num_dp_ports && crtc_state->active && !dcp->connector->connected) {
+		dev_err(dcp->dev, "crtc_atomic_check: no display on port %d\n",
+			dcp->active_dp_port);
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -530,6 +544,37 @@ int dcp_dp_port_connect(struct platform_device *pdev, unsigned int port)
 	return ret;
 }
 
+/*
+ * The DCP told us the display is gone. That can arrive without (or long
+ * before) the Type-C disconnect, for instance when a display stops asserting
+ * HPD while blanked, so release the port here too. Runs from a work queue,
+ * the firmware callback must not block on DPTX traffic.
+ */
+static void dcp_dp_release_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, dp_release_wq);
+	int port;
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		port = dcp->active_dp_port;
+		if (port < 0)
+			return;
+	}
+
+	dev_info(dcp->dev, "port %d: display gone, releasing\n", port);
+
+	dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_dp_unbind_port(dcp);
+}
+
+void dcp_dp_display_gone(struct apple_dcp *dcp)
+{
+	if (dcp->num_dp_ports && dcp->active_dp_port >= 0)
+		schedule_work(&dcp->dp_release_wq);
+}
+
 int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -548,6 +593,70 @@ int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port)
 	dcp_dp_unbind_port(dcp);
 
 	return 0;
+}
+
+static int dcp_dp_ports_show(struct seq_file *m, void *unused)
+{
+	struct apple_dcp *dcp = m->private;
+	unsigned int i;
+
+	guard(mutex)(&dcp->hpd_mutex);
+
+	seq_printf(m, "active port: %d\n", dcp->active_dp_port);
+	for (i = 0; i < dcp->num_dp_ports; i++) {
+		struct dcp_dp_port *p = &dcp->dp_ports[i];
+
+		seq_printf(m, "port %u: %pfwP dptx-phy %u connector %s%s\n", i,
+			   p->fwnode, p->dptx_phy,
+			   p->connector ? p->connector->base.name : "none",
+			   p->connector && p->connector->connected ? " connected" : "");
+	}
+
+	return 0;
+}
+
+static int dcp_dp_ports_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, dcp_dp_ports_show, inode->i_private);
+}
+
+/* "release" forces the active port to be released, for debugging */
+static ssize_t dcp_dp_ports_write(struct file *file, const char __user *ubuf,
+				  size_t len, loff_t *ppos)
+{
+	struct apple_dcp *dcp = ((struct seq_file *)file->private_data)->private;
+	char buf[16];
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	if (!sysfs_streq(buf, "release"))
+		return -EINVAL;
+
+	dcp_dp_display_gone(dcp);
+
+	return len;
+}
+
+static const struct file_operations dcp_dp_ports_fops = {
+	.owner = THIS_MODULE,
+	.open = dcp_dp_ports_open,
+	.read = seq_read,
+	.write = dcp_dp_ports_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+void dcp_dp_ports_debugfs_init(struct platform_device *pdev, struct dentry *root)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp->num_dp_ports)
+		debugfs_create_file("dp_ports", 0644, root, dcp,
+				    &dcp_dp_ports_fops);
 }
 
 unsigned int dcp_get_num_dp_ports(struct platform_device *pdev)
@@ -1245,6 +1354,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	set_bit(0, dcp->memdesc_map);
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_WORK(&dcp->dp_release_wq, dcp_dp_release_work);
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
