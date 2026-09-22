@@ -530,10 +530,12 @@ int dcp_dp_port_connect(struct platform_device *pdev, unsigned int port)
 		return -EINVAL;
 
 	scoped_guard(mutex, &dcp->hpd_mutex) {
+		dcp->dp_ports[port].oob_connected = true;
 		ret = dcp_dp_bind_port(dcp, port);
 		if (ret)
 			return ret;
 	}
+	dcp->dp_relink_attempts = 0;
 
 	ret = dcp_dptx_connect(dcp, 0);
 	if (ret) {
@@ -545,24 +547,55 @@ int dcp_dp_port_connect(struct platform_device *pdev, unsigned int port)
 }
 
 /*
- * The DCP told us the display is gone. That can arrive without (or long
- * before) the Type-C disconnect, for instance when a display stops asserting
- * HPD while blanked, so release the port here too. Runs from a work queue,
- * the firmware callback must not block on DPTX traffic.
+ * The DCP told us the display on the bound port is gone. Two cases:
+ *
+ * - the cable is gone: the Type-C stack has already told us, so release the
+ *   port and let another one take the DCP.
+ * - the link dropped while the cable is still there: displays do that on
+ *   their own, for instance shortly after a modeset or while blanked. No
+ *   further Type-C event will come, so take the link down and bring it back
+ *   up ourselves. Giving up here would leave the display dark until replug.
  */
-static void dcp_dp_release_work(struct work_struct *work)
+#define DCP_DP_RELINK_DELAY	msecs_to_jiffies(1000)
+#define DCP_DP_RELINK_TRIES	3
+
+static void dcp_dp_recover_work(struct work_struct *work)
 {
-	struct apple_dcp *dcp = container_of(work, struct apple_dcp, dp_release_wq);
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, dp_recover_wq);
+	bool cable_gone;
 	int port;
 
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		port = dcp->active_dp_port;
 		if (port < 0)
 			return;
+		cable_gone = !dcp->dp_ports[port].oob_connected;
 	}
 
-	dev_info(dcp->dev, "port %d: display gone, releasing\n", port);
+	/* came back on its own while we waited */
+	if (!cable_gone && dcp->connector && dcp->connector->connected) {
+		dcp->dp_relink_attempts = 0;
+		return;
+	}
 
+	if (!cable_gone && dcp->dp_relink_attempts < DCP_DP_RELINK_TRIES) {
+		dcp->dp_relink_attempts++;
+		dev_info(dcp->dev, "port %d: link lost, relinking (%u/%u)\n",
+			 port, dcp->dp_relink_attempts, DCP_DP_RELINK_TRIES);
+
+		dcp_dptx_disconnect(dcp, 0);
+		msleep(100);
+		dcp_dptx_connect(dcp, 0);
+
+		schedule_delayed_work(&dcp->dp_recover_wq, DCP_DP_RELINK_DELAY);
+		return;
+	}
+
+	dev_info(dcp->dev, "port %d: %s, releasing\n", port,
+		 cable_gone ? "display gone" : "link lost for good");
+
+	dcp->dp_relink_attempts = 0;
 	dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 
 	guard(mutex)(&dcp->hpd_mutex);
@@ -572,7 +605,16 @@ static void dcp_dp_release_work(struct work_struct *work)
 void dcp_dp_display_gone(struct apple_dcp *dcp)
 {
 	if (dcp->num_dp_ports && dcp->active_dp_port >= 0)
-		schedule_work(&dcp->dp_release_wq);
+		mod_delayed_work(system_wq, &dcp->dp_recover_wq,
+				 DCP_DP_RELINK_DELAY);
+}
+
+void dcp_dp_display_back(struct apple_dcp *dcp)
+{
+	if (dcp->num_dp_ports && dcp->active_dp_port >= 0) {
+		dcp->dp_relink_attempts = 0;
+		cancel_delayed_work(&dcp->dp_recover_wq);
+	}
 }
 
 int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port)
@@ -583,10 +625,14 @@ int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port)
 		return -EINVAL;
 
 	/* events from ports we are not driving are not ours to act on */
-	scoped_guard(mutex, &dcp->hpd_mutex)
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		dcp->dp_ports[port].oob_connected = false;
 		if (dcp->active_dp_port != port)
 			return 0;
+	}
 
+	cancel_delayed_work_sync(&dcp->dp_recover_wq);
+	dcp->dp_relink_attempts = 0;
 	dcp_dptx_disconnect_oob(pdev, 0);
 
 	guard(mutex)(&dcp->hpd_mutex);
@@ -1354,7 +1400,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	set_bit(0, dcp->memdesc_map);
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
-	INIT_WORK(&dcp->dp_release_wq, dcp_dp_release_work);
+	INIT_DELAYED_WORK(&dcp->dp_recover_wq, dcp_dp_recover_work);
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);

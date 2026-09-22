@@ -124,6 +124,8 @@ struct dcp_dp_port {
 	struct apple_connector *connector;
 	/* ATC PHY index the DCP firmware is told to use for this port */
 	u32 dptx_phy;
+	/* the Type-C stack says a DP sink is attached to this port */
+	bool oob_connected;
 };
 
 struct apple_dcp {
@@ -284,7 +286,8 @@ struct apple_dcp {
 	 * of them while a display is connected: its crossbar is selected and
 	 * "phy"/"dptx_phy"/"connector" above point at that port.
 	 */
-	struct work_struct dp_release_wq;
+	struct delayed_work dp_recover_wq;
+	unsigned int dp_relink_attempts;
 	struct dcp_dp_port dp_ports[DCP_MAX_DP_PORTS];
 	unsigned int num_dp_ports;
 	int active_dp_port;
@@ -296,6 +299,7 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 
 /* the DCP reported that the display on the bound Type-C port is gone */
 void dcp_dp_display_gone(struct apple_dcp *dcp);
+void dcp_dp_display_back(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
