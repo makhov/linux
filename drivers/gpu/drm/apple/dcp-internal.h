@@ -266,6 +266,18 @@ struct apple_dcp {
 	u32 dptx_phy;
 	u32 dptx_die;
 	int hdmi_hpd_irq;
+
+	/*
+	 * EXPERIMENT: runtime DP route switching between two Type-C ports,
+	 * see dcp_dptx_set_route(). Route 0 is "dp-phy"/"dp-xbar", route 1
+	 * "dp-phy-alt"/"dp-xbar-alt".
+	 */
+	struct phy *route_phy[2];
+	struct mux_control *route_xbar[2];
+	u32 route_dptx_phy[2];
+	u32 mux_index;
+	bool xbar_selected;
+	int route;
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);

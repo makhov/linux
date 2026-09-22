@@ -6,6 +6,7 @@
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/component.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
@@ -18,6 +19,7 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -449,6 +451,96 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		dptxport_set_hpd(dcp->dptxport[port].service, false);
 
 	return dcp_dptx_disconnect(dcp, port);
+}
+
+/*
+ * EXPERIMENT: point this DCP at another Type-C port at runtime. Only allowed
+ * while no display is connected. The firmware gets the new PHY on the next
+ * dcp_dptx_connect() through dcp->dptx_phy.
+ */
+static int dcp_dptx_set_route(struct apple_dcp *dcp, int route)
+{
+	int old = dcp->route;
+	int ret;
+
+	if (route < 0 || route > 1)
+		return -EINVAL;
+	if (!dcp->route_phy[route] || !dcp->route_xbar[route])
+		return -ENODEV;
+
+	guard(mutex)(&dcp->hpd_mutex);
+
+	if (route == old)
+		return 0;
+	if (dcp->dptxport[0].connected || dcp->dptxport[1].connected)
+		return -EBUSY;
+
+	if (dcp->xbar_selected)
+		mux_control_deselect(dcp->route_xbar[old]);
+	dcp->xbar_selected = false;
+
+	ret = mux_control_try_select(dcp->route_xbar[route], dcp->mux_index);
+	if (ret) {
+		dev_err(dcp->dev, "route %d: xbar select failed: %d\n", route, ret);
+		if (!mux_control_try_select(dcp->route_xbar[old], dcp->mux_index))
+			dcp->xbar_selected = true;
+		return ret;
+	}
+	dcp->xbar_selected = true;
+
+	dcp->phy = dcp->route_phy[route];
+	dcp->xbar = dcp->route_xbar[route];
+	dcp->dptx_phy = dcp->route_dptx_phy[route];
+	dcp->route = route;
+
+	dev_info(dcp->dev, "DP route %d -> %d, dptx target phy %u\n", old, route,
+		 dcp->dptx_phy);
+	return 0;
+}
+
+static int dcp_dp_route_show(struct seq_file *m, void *unused)
+{
+	struct apple_dcp *dcp = m->private;
+
+	seq_printf(m, "route %d dptx-phy %u connected %d\n", dcp->route,
+		   dcp->dptx_phy, dcp->dptxport[0].connected);
+	return 0;
+}
+
+static int dcp_dp_route_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, dcp_dp_route_show, inode->i_private);
+}
+
+static ssize_t dcp_dp_route_write(struct file *file, const char __user *ubuf,
+				  size_t len, loff_t *ppos)
+{
+	struct apple_dcp *dcp = ((struct seq_file *)file->private_data)->private;
+	int route, ret;
+
+	ret = kstrtoint_from_user(ubuf, len, 0, &route);
+	if (ret)
+		return ret;
+
+	ret = dcp_dptx_set_route(dcp, route);
+	return ret ? ret : len;
+}
+
+static const struct file_operations dcp_dp_route_fops = {
+	.owner = THIS_MODULE,
+	.open = dcp_dp_route_open,
+	.read = seq_read,
+	.write = dcp_dp_route_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+void dcp_dp_route_debugfs_init(struct platform_device *pdev, struct dentry *root)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp->route_phy[1] && dcp->route_xbar[1])
+		debugfs_create_file("dp_route", 0644, root, dcp, &dcp_dp_route_fops);
 }
 
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
@@ -992,6 +1084,9 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					   &dcp->dptx_phy);
 	of_property_read_u32(dev->of_node, "apple,dptx-die",
 					   &dcp->dptx_die);
+	dcp->route_dptx_phy[0] = dcp->dptx_phy;
+	of_property_read_u32(dev->of_node, "apple,dptx-phy-alt",
+			     &dcp->route_dptx_phy[1]);
 	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
@@ -1187,6 +1282,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
 	}
+	dcp->route_phy[0] = dcp->phy;
+	dcp->route_phy[1] = devm_phy_optional_get(dev, "dp-phy-alt");
+	if (IS_ERR(dcp->route_phy[1])) {
+		dev_err(dev, "Failed to get dp-phy-alt: %ld\n",
+			PTR_ERR(dcp->route_phy[1]));
+		return PTR_ERR(dcp->route_phy[1]);
+	}
 
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
@@ -1267,6 +1369,18 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			ret = mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
+			dcp->xbar_selected = !ret;
+			dcp->mux_index = mux_index;
+			dcp->route_xbar[0] = dcp->xbar;
+			if (of_property_match_string(dev->of_node, "mux-control-names",
+						     "dp-xbar-alt") >= 0) {
+				dcp->route_xbar[1] = devm_mux_control_get(dev, "dp-xbar-alt");
+				if (IS_ERR(dcp->route_xbar[1])) {
+					dev_err(dev, "Failed to get dp-xbar-alt: %ld\n",
+						PTR_ERR(dcp->route_xbar[1]));
+					return PTR_ERR(dcp->route_xbar[1]);
+				}
+			}
 
 			/*
 			 * Switch atcphy to DP-only. should move to a Macbook Pro

@@ -14,6 +14,7 @@
 
 #include <drm/drm_managed.h>
 
+#include "dcp.h"
 #include "dcp-internal.h"
 
 enum dcp_chunk_type {
@@ -115,6 +116,7 @@ void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry
 	case DRM_MODE_CONNECTOR_DisplayPort:
 	case DRM_MODE_CONNECTOR_HDMIA:
 		dcp_afk_debugfs_root(apple_con->dcp, AV_ENDPOINT, root);
+		dcp_dp_route_debugfs_init(apple_con->dcp, root);
 		break;
 	default:
 		break;
