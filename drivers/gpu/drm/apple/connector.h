@@ -22,6 +22,9 @@ struct apple_connector {
 
 	struct platform_device *dcp;
 
+	/* DP capable Type-C port this connector represents, -1 if none */
+	int dp_port;
+
 	const struct drm_edid *drm_edid;
 
 	/* Workqueue for sending hotplug events to the associated device */

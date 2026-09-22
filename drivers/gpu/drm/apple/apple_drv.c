@@ -91,11 +91,19 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 
 	printk("#### oob_hotplug status:0x%x ####\n", (u32)status);
 
-	if (status == connector_status_connected)
-		dcp_dptx_connect_oob(apple_connector->dcp, 0);
-	else if (status == connector_status_disconnected)
-		dcp_dptx_disconnect_oob(apple_connector->dcp, 0);
-	else
+	if (status == connector_status_connected) {
+		if (apple_connector->dp_port >= 0)
+			dcp_dp_port_connect(apple_connector->dcp,
+					    apple_connector->dp_port);
+		else
+			dcp_dptx_connect_oob(apple_connector->dcp, 0);
+	} else if (status == connector_status_disconnected) {
+		if (apple_connector->dp_port >= 0)
+			dcp_dp_port_disconnect(apple_connector->dcp,
+					       apple_connector->dp_port);
+		else
+			dcp_dptx_disconnect_oob(apple_connector->dcp, 0);
+	} else
 		dev_err(&apple_connector->dcp->dev, "unexpected connector status"
 			":0x%x in oob_hotplug event\n", (u32)status);
 }
@@ -276,6 +284,7 @@ static int apple_probe_per_dcp(struct device *dev,
 	unsigned long *iomfb_surfaces = dcp_get_iomfb_surfaces(dcp);
 	int ret;
 	u32 surf;
+	unsigned int num_conn, i;
 	int zpos = 0;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
 	enum drm_plane_type plane_type;
@@ -315,30 +324,57 @@ static int apple_probe_per_dcp(struct device *dev,
                 return PTR_ERR(enc);
 	enc->base.possible_crtcs = drm_crtc_mask(&crtc->base);
 
-	connector = kzalloc(sizeof(*connector), GFP_KERNEL);
-	mutex_init(&connector->chunk_lock);
-	drm_connector_helper_add(&connector->base,
-				 &apple_connector_helper_funcs);
+	/*
+	 * One connector per DP capable Type-C port, so that hotplug events
+	 * from the Type-C stack land on the connector for the port they came
+	 * from. The DCP is bound to one of them at a time. Without such ports
+	 * there is a single connector for this DCP.
+	 */
+	num_conn = max(dcp_get_num_dp_ports(dcp), 1U);
 
-	// HACK:
-	if (dcp_ext)
-		connector->base.fwnode = fwnode_handle_get(dcp->dev.fwnode);
+	for (i = 0; i < num_conn; i++) {
+		connector = kzalloc(sizeof(*connector), GFP_KERNEL);
+		if (!connector)
+			return -ENOMEM;
 
-	ret = drm_connector_init(drm, &connector->base, &apple_connector_funcs,
-				 dcp_get_connector_type(dcp));
-	if (ret)
-		return ret;
+		mutex_init(&connector->chunk_lock);
+		drm_connector_helper_add(&connector->base,
+					 &apple_connector_helper_funcs);
 
-	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
-	connector->connected = false;
-	connector->dcp = dcp;
+		connector->dp_port = dcp_get_num_dp_ports(dcp) ? i : -1;
 
-	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+		if (connector->dp_port >= 0)
+			connector->base.fwnode =
+				fwnode_handle_get(dcp_get_dp_port_fwnode(dcp, i));
+		else if (dcp_ext)
+			// HACK:
+			connector->base.fwnode = fwnode_handle_get(dcp->dev.fwnode);
 
-	crtc->dcp = dcp;
-	dcp_link(dcp, crtc, connector);
+		ret = drm_connector_init(drm, &connector->base,
+					 &apple_connector_funcs,
+					 dcp_get_connector_type(dcp));
+		if (ret)
+			return ret;
 
-	return drm_connector_attach_encoder(&connector->base, &enc->base);
+		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
+		connector->connected = false;
+		connector->dcp = dcp;
+
+		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+
+		if (connector->dp_port >= 0)
+			dcp_link_dp_port(dcp, i, connector);
+		if (i == 0) {
+			crtc->dcp = dcp;
+			dcp_link(dcp, crtc, connector);
+		}
+
+		ret = drm_connector_attach_encoder(&connector->base, &enc->base);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int apple_get_fb_resource(struct device *dev, const char *name,

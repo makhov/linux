@@ -451,6 +451,187 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	return dcp_dptx_disconnect(dcp, port);
 }
 
+/*
+ * Bind this DCP to one of its DP capable Type-C ports: route the port's
+ * crossbar to us and use the port's PHY from now on. The DCP firmware learns
+ * about the PHY with the next dptxport_connect().
+ */
+static int dcp_dp_bind_port(struct apple_dcp *dcp, unsigned int port)
+{
+	struct dcp_dp_port *p = &dcp->dp_ports[port];
+	int ret;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+
+	if (dcp->active_dp_port == port)
+		return 0;
+	if (dcp->active_dp_port >= 0) {
+		dev_info(dcp->dev,
+			 "port %u: already driving port %d, ignoring\n", port,
+			 dcp->active_dp_port);
+		return -EBUSY;
+	}
+
+	ret = mux_control_try_select(p->xbar, dcp->mux_index);
+	if (ret) {
+		dev_err(dcp->dev, "port %u: crossbar select failed: %d\n", port,
+			ret);
+		return ret;
+	}
+
+	dcp->xbar_selected = true;
+	dcp->xbar = p->xbar;
+	dcp->phy = p->phy;
+	dcp->dptx_phy = p->dptx_phy;
+	dcp->connector = p->connector;
+	dcp->active_dp_port = port;
+
+	dev_dbg(dcp->dev, "port %u: bound, dptx target phy %u\n", port,
+		p->dptx_phy);
+
+	return 0;
+}
+
+static void dcp_dp_unbind_port(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+
+	if (dcp->active_dp_port < 0)
+		return;
+
+	dev_dbg(dcp->dev, "port %d: unbound\n", dcp->active_dp_port);
+
+	if (dcp->xbar_selected)
+		mux_control_deselect(dcp->xbar);
+	dcp->xbar_selected = false;
+	dcp->active_dp_port = -1;
+}
+
+int dcp_dp_port_connect(struct platform_device *pdev, unsigned int port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
+
+	if (port >= dcp->num_dp_ports)
+		return -EINVAL;
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		ret = dcp_dp_bind_port(dcp, port);
+		if (ret)
+			return ret;
+	}
+
+	ret = dcp_dptx_connect(dcp, 0);
+	if (ret) {
+		guard(mutex)(&dcp->hpd_mutex);
+		dcp_dp_unbind_port(dcp);
+	}
+
+	return ret;
+}
+
+int dcp_dp_port_disconnect(struct platform_device *pdev, unsigned int port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (port >= dcp->num_dp_ports)
+		return -EINVAL;
+
+	/* events from ports we are not driving are not ours to act on */
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		if (dcp->active_dp_port != port)
+			return 0;
+
+	dcp_dptx_disconnect_oob(pdev, 0);
+
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_dp_unbind_port(dcp);
+
+	return 0;
+}
+
+unsigned int dcp_get_num_dp_ports(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->num_dp_ports;
+}
+
+struct fwnode_handle *dcp_get_dp_port_fwnode(struct platform_device *pdev,
+					     unsigned int port)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (port >= dcp->num_dp_ports)
+		return NULL;
+
+	return dcp->dp_ports[port].fwnode;
+}
+
+void dcp_link_dp_port(struct platform_device *pdev, unsigned int port,
+		      struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (port < dcp->num_dp_ports)
+		dcp->dp_ports[port].connector = connector;
+}
+
+/*
+ * Type-C ports this DCP can drive:
+ *   apple,dp-connectors = <&typec0>, <&typec1>, ...;   usb-c-connector nodes
+ *   apple,dptx-phys = <0 1 ...>;                       ATC index per port
+ *   phys/phy-names, mux-controls/mux-control-names:    "dp-portN", "dp-xbarN"
+ */
+static int dcp_parse_dp_ports(struct device *dev, struct apple_dcp *dcp)
+{
+	u32 dptx_phys[DCP_MAX_DP_PORTS];
+	int num, i, ret;
+
+	dcp->active_dp_port = -1;
+
+	num = device_property_count_u32(dev, "apple,dptx-phys");
+	if (num <= 0)
+		return 0;
+	if (num > DCP_MAX_DP_PORTS) {
+		dev_err(dev, "too many DP ports: %d\n", num);
+		return -EINVAL;
+	}
+
+	ret = device_property_read_u32_array(dev, "apple,dptx-phys", dptx_phys,
+					     num);
+	if (ret)
+		return dev_err_probe(dev, ret, "apple,dptx-phys\n");
+
+	for (i = 0; i < num; i++) {
+		struct dcp_dp_port *p = &dcp->dp_ports[i];
+		char name[16];
+
+		p->dptx_phy = dptx_phys[i];
+
+		p->fwnode = fwnode_find_reference(dev_fwnode(dev),
+						  "apple,dp-connectors", i);
+		if (IS_ERR(p->fwnode))
+			return dev_err_probe(dev, PTR_ERR(p->fwnode),
+					     "apple,dp-connectors[%d]\n", i);
+
+		snprintf(name, sizeof(name), "dp-port%d", i);
+		p->phy = devm_phy_get(dev, name);
+		if (IS_ERR(p->phy))
+			return dev_err_probe(dev, PTR_ERR(p->phy), "%s\n", name);
+
+		snprintf(name, sizeof(name), "dp-xbar%d", i);
+		p->xbar = devm_mux_control_get(dev, name);
+		if (IS_ERR(p->xbar))
+			return dev_err_probe(dev, PTR_ERR(p->xbar), "%s\n", name);
+	}
+
+	dcp->num_dp_ports = num;
+	dev_info(dev, "%d DP capable Type-C ports\n", num);
+
+	return 0;
+}
+
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 {
 	struct apple_dcp *dcp = data;
@@ -1159,6 +1340,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	int surf, num_surfs;
 	u32 surf_en;
 	u32 mux_index;
+	int ret;
 
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
@@ -1187,6 +1369,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
 	}
+
+	ret = dcp_parse_dp_ports(dev, dcp);
+	if (ret)
+		return ret;
+	if (dcp->num_dp_ports)
+		dcp->phy = dcp->dp_ports[0].phy;
 
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
@@ -1258,7 +1446,15 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 
 		ret = of_property_read_u32(dev->of_node, "mux-index", &mux_index);
-		if (!ret) {
+		if (!ret)
+			dcp->mux_index = mux_index;
+
+		/*
+		 * With DP capable Type-C ports the crossbar is selected per
+		 * hotplug, for whichever port the display is on, and the PHY
+		 * mode is set by the Type-C stack.
+		 */
+		if (!ret && !dcp->num_dp_ports) {
 			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
 			if (IS_ERR(dcp->xbar)) {
 				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));
@@ -1267,6 +1463,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			ret = mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
+			dcp->xbar_selected = !ret;
 
 			/*
 			 * Switch atcphy to DP-only. should move to a Macbook Pro
